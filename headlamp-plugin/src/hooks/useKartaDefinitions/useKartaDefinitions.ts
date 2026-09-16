@@ -55,6 +55,7 @@ export function useKartaDefinitions(cluster: string): UseKartaDefinitionsResult 
   // have none, so reporting installed early would show catalog definitions as
   // the whole truth.
   const clusterLoading = clusterKartas === null && clusterError === null;
+
   const crdMissing = clusterError?.status === 404;
 
   // Only a 404 means the definitions are gone. Every other failure left them
