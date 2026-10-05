@@ -13,6 +13,7 @@
 import json
 import sys
 
+entries = []  # in first-seen order; a further version goes right after its siblings
 seen = set()
 for fname in sys.argv[1:]:
     with open(fname) as f:
@@ -29,4 +30,10 @@ for fname in sys.argv[1:]:
         if not key[0] or key in seen:
             continue
         seen.add(key)
-        print(json.dumps(obj))
+        # go-licence-detector keeps this order, so a second version of a package
+        # lands next to the first and the NOTICE template can fold them.
+        last = max((i for i, e in enumerate(entries) if e["Path"] == key[0]), default=len(entries) - 1)
+        entries.insert(last + 1, obj)
+
+for obj in entries:
+    print(json.dumps(obj))
