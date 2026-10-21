@@ -26,7 +26,7 @@ import (
 	"github.com/dsx-ai-factory/workload-map/cli/pkg/definitions"
 	"github.com/dsx-ai-factory/workload-map/cli/pkg/generator"
 	"github.com/dsx-ai-factory/workload-map/cli/pkg/workload"
-	"github.com/dsx-ai-factory/workload-map/pkg/catalog"
+	"github.com/dsx-ai-factory/workload-map/karta/sdk/pkg/catalog"
 )
 
 const (
@@ -148,6 +148,13 @@ func newDescribeCommand() *cobra.Command {
 			}
 			return nil
 		}),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// -f takes the kind from the manifest, so no argument is accepted.
+			if opts.file != "" {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return completeWorkloads(cmd, args, toComplete)
+		},
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			// A negative limit collides with the ShowAllPods sentinel.
 			if opts.podLimit < 0 {
@@ -228,7 +235,8 @@ func describeLive(
 	if err != nil {
 		return nil, warnings, fmt.Errorf("list pods: %w", err)
 	}
-	owned, err := workload.NewPodAttributor(look.dyn, look.mapper).Filter(ctx, pods, obj.GetUID())
+	owned, attributeWarnings, err := workload.NewPodAttributor(look.metadata, look.mapper).Filter(ctx, pods, obj.GetUID())
+	warnings = append(warnings, attributeWarnings...)
 	if err != nil {
 		return nil, warnings, fmt.Errorf("attribute pods: %w", err)
 	}

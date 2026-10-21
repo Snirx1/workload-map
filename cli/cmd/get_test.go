@@ -14,25 +14,30 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/metadata"
+	metadatafake "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/dsx-ai-factory/workload-map/cli/pkg/definitions"
-	"github.com/dsx-ai-factory/workload-map/pkg/api/runai/v1alpha1"
-	"github.com/dsx-ai-factory/workload-map/pkg/catalog"
-	"github.com/dsx-ai-factory/workload-map/pkg/catalog/kartas"
+	"github.com/dsx-ai-factory/workload-map/karta/sdk/pkg/api/runai/v1alpha1"
+	"github.com/dsx-ai-factory/workload-map/karta/sdk/pkg/catalog"
+	"github.com/dsx-ai-factory/workload-map/karta/sdk/pkg/catalog/kartas"
 )
 
 var (
 	jobSetGVK = schema.GroupVersionKind{Group: "jobset.x-k8s.io", Version: "v1alpha2", Kind: "JobSet"}
 	jobSetGVR = jobSetGVK.GroupVersion().WithResource("jobsets")
+
+	namespaceGVR = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 )
 
 // jobSet builds a JobSet with one replicated job of the given parallelism.
@@ -62,14 +67,17 @@ func jobSetIn(namespace, name string, parallelism int64) *unstructured.Unstructu
 	}}
 }
 
-// fakeCluster points the get command at an in-memory cluster serving only the
-// JobSet type, and restores the real client factory afterwards.
+// fakeCluster points the get command at an in-memory cluster serving the
+// JobSet type and namespaces, and restores the real client factory afterwards.
 func fakeCluster(t *testing.T, objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
 	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{jobSetGVR: "JobSetList"}, objects...)
+		map[schema.GroupVersionResource]string{
+			jobSetGVR:    "JobSetList",
+			namespaceGVR: "NamespaceList",
+		}, objects...)
 
 	mapper := meta.NewDefaultRESTMapper(nil)
 	mapper.AddSpecific(jobSetGVK, jobSetGVR, jobSetGVK.GroupVersion().WithResource("jobset"), meta.RESTScopeNamespace)
@@ -77,6 +85,7 @@ func fakeCluster(t *testing.T, objects ...runtime.Object) *dynamicfake.FakeDynam
 	restore := newDynamicClient
 	newDynamicClient = func(genericclioptions.RESTClientGetter) (dynamic.Interface, error) { return client, nil }
 	t.Cleanup(func() { newDynamicClient = restore })
+	fakeMetadata(t, objects...)
 
 	flags := genericclioptions.NewTestConfigFlags().
 		WithClientConfig(clientcmd.NewDefaultClientConfig(*clientcmdapi.NewConfig(), nil)).
@@ -86,6 +95,33 @@ func fakeCluster(t *testing.T, objects ...runtime.Object) *dynamicfake.FakeDynam
 	restoreAccess := clusterAccess
 	clusterAccess = func() genericclioptions.RESTClientGetter { return flags }
 	t.Cleanup(func() { clusterAccess = restoreAccess })
+
+	return client
+}
+
+// fakeMetadata serves the metadata of objects, which is what owner walks read,
+// and restores the real client factory afterwards.
+func fakeMetadata(t *testing.T, objects ...runtime.Object) *metadatafake.FakeMetadataClient {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := metav1.AddMetaToScheme(scheme); err != nil {
+		t.Fatalf("register metadata types: %v", err)
+	}
+	partials := make([]runtime.Object, 0, len(objects))
+	for _, obj := range objects {
+		var partial metav1.PartialObjectMetadata
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(
+			obj.(*unstructured.Unstructured).Object, &partial); err != nil {
+			t.Fatalf("convert %v to metadata: %v", obj, err)
+		}
+		partials = append(partials, &partial)
+	}
+	client := metadatafake.NewSimpleMetadataClient(scheme, partials...)
+
+	restore := newMetadataClient
+	newMetadataClient = func(genericclioptions.RESTClientGetter) (metadata.Interface, error) { return client, nil }
+	t.Cleanup(func() { newMetadataClient = restore })
 
 	return client
 }
@@ -473,7 +509,7 @@ func dynamoGraph() *unstructured.Unstructured {
 
 // setupDynamoCluster serves a Kind the catalog covers at two versions, which is
 // what makes the bare type token ambiguous.
-func setupDynamoCluster(t *testing.T) {
+func setupDynamoCluster(t *testing.T) *dynamicfake.FakeDynamicClient {
 	alpha := dynamoGVK.GroupVersion().WithResource("dynamographdeployments")
 	beta := schema.GroupVersion{Group: "nvidia.com", Version: "v1beta1"}.WithResource("dynamographdeployments")
 
@@ -490,15 +526,18 @@ func setupDynamoCluster(t *testing.T) {
 	restore := newDynamicClient
 	newDynamicClient = func(genericclioptions.RESTClientGetter) (dynamic.Interface, error) { return client, nil }
 	t.Cleanup(func() { newDynamicClient = restore })
+	fakeMetadata(t, dynamoGraph())
 
 	flags := genericclioptions.NewTestConfigFlags().
 		WithClientConfig(clientcmd.NewDefaultClientConfig(*clientcmdapi.NewConfig(), nil)).
 		WithNamespace("ml-team").
-		WithRESTMapper(mapper)
+		WithRESTMapper(mapper).
+		WithDiscoveryClient(&fakeDiscovery{server: discoveryServer(t, []schema.GroupVersion{dynamoGVK.GroupVersion()})})
 	restoreAccess := clusterAccess
 	clusterAccess = func() genericclioptions.RESTClientGetter { return flags }
 	t.Cleanup(func() { clusterAccess = restoreAccess })
 
+	return client
 }
 
 // The ambiguity error names a token, which must itself resolve: a user who
